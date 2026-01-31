@@ -9,8 +9,7 @@ dist/
 build/
 
 # Data files (large files should not be committed)
-data/**/*.npz
-data/**/*.pkl
+# Note: data folder files are included in the repository
 pretrained_model/*.pt
 
 # IDE
