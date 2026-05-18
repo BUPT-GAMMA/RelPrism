@@ -39,7 +39,7 @@ from sklearn.preprocessing import StandardScaler
 # --- Argument Parser ---
 parser = argparse.ArgumentParser()
 parser.add_argument("--dataset", type=str, default="rel-f1")
-parser.add_argument("--task", type=str, default="driver-top3")
+parser.add_argument("--task", type=str, default="driver-dnf")
 parser.add_argument("--target_node_type", type=str, default=None)
 parser.add_argument("--lr", type=float, default=0.001, help="Learning rate for GNN backbone")
 parser.add_argument("--epochs", type=int, default=100)
@@ -51,7 +51,6 @@ parser.add_argument("--num_neighbors", type=int, default=128)
 parser.add_argument("--temporal_strategy", type=str, default="last")
 parser.add_argument("--num_workers", type=int, default=0)
 parser.add_argument("--seed", type=int, default=42)
-parser.add_argument("--cache_dir", type=str, default=os.path.expanduser("/local/yjy/relbench_examples"))
 parser.add_argument("--k_shot", type=int, default=5, help="Number of support samples per class")
 parser.add_argument("--n_way", type=int, default=2, help="Number of clusters/classes per episode")
 parser.add_argument("--meta_batch_size", type=int, default=32, help="Episodes per epoch")
@@ -60,6 +59,9 @@ parser.add_argument("--accum_steps", type=int, default=16, help="Gradient accumu
 parser.add_argument("--use_structure", type=int, default=1, help="Whether to use structure features")
 parser.add_argument("--is_eval", type=int, default=1, help="1: eval, 0: train")
 args = parser.parse_args()
+
+SCRIPT_DIR = Path(__file__).parent
+os.chdir(SCRIPT_DIR)
 
 def set_global_seed(seed: int):
     random.seed(seed)
@@ -89,7 +91,6 @@ model_config['num_model_layers'] = int(model_config['num_model_layers'] / 2) if 
 fact_tables, data, all_node_time = make_graph_without_fact_tables(
     db=dataset.get_db(),
     feat_data_dir=f"./data/{args.dataset}-final",
-    dataset_name=args.dataset,
 )
 
 def inject_statistical_features(data, target_node_type, structural_weight=10.0):
@@ -306,6 +307,112 @@ def compute_prototypes(support_embeddings, support_labels, n_way):
             prototypes[c] = support_embeddings[mask].mean(0)
     return prototypes
 
+def compute_dynamic_struct_features_for_nodes(
+    data,
+    target_node_type: str,
+    node_indices: torch.Tensor,
+    cutoff_times: torch.Tensor,
+    structural_weight: float = 10.0,
+):
+    device_cpu = torch.device("cpu")
+    node_indices = node_indices.to(device_cpu).long()
+    cutoff_times = cutoff_times.to(device_cpu).long()
+
+    num_nodes = data[target_node_type].num_nodes
+
+    if target_node_type in all_node_time:
+        node_cutoff_times = all_node_time[target_node_type].cpu().clone().long()
+    else:
+        node_cutoff_times = torch.zeros(num_nodes, dtype=torch.long)
+    node_cutoff_times[node_indices] = cutoff_times
+
+    raw_feat = data[target_node_type].feat.cpu()
+
+    node_degree = torch.zeros(num_nodes, dtype=torch.float32)
+    edge_attr_mean = torch.zeros(num_nodes, dtype=torch.float32)
+    edge_attr_sum = torch.zeros(num_nodes, dtype=torch.float32)
+    neighbor_norm_agg = torch.zeros(num_nodes, dtype=torch.float32)
+
+    def get_valid_edges(edge_type, mode: str):
+        edge_store = data[edge_type]
+        edge_index = edge_store.edge_index.cpu()
+
+        if hasattr(edge_store, "time") and edge_store.time is not None:
+            edge_time = edge_store.time.cpu().long()
+            target_idx = edge_index[0] if mode == "src" else edge_index[1]
+            cutoff = node_cutoff_times[target_idx]
+            mask = (edge_time <= cutoff) & (cutoff > 0)
+            edge_index = edge_index[:, mask]
+            edge_attr = None
+            if hasattr(edge_store, "feat") and edge_store.feat is not None:
+                edge_attr = edge_store.feat.cpu()[mask]
+            return edge_index, edge_attr
+        else:
+            edge_attr = None
+            if hasattr(edge_store, "feat") and edge_store.feat is not None:
+                edge_attr = edge_store.feat.cpu()
+            return edge_index, edge_attr
+
+    for edge_type in data.edge_types:
+        src, _, dst = edge_type
+        if src == target_node_type:
+            ei, _ = get_valid_edges(edge_type, mode="src")
+            if ei.numel() > 0:
+                d = pyg_utils.degree(ei[0], num_nodes=num_nodes)
+                node_degree += d
+        if dst == target_node_type:
+            ei, _ = get_valid_edges(edge_type, mode="dst")
+            if ei.numel() > 0:
+                d = pyg_utils.degree(ei[1], num_nodes=num_nodes)
+                node_degree += d
+
+    for edge_type in data.edge_types:
+        src, _, _ = edge_type
+        if src != target_node_type:
+            continue
+        ei, e_attr = get_valid_edges(edge_type, mode="src")
+        if e_attr is None or ei.numel() == 0:
+            continue
+        if e_attr.dim() > 1 and e_attr.size(1) > 1:
+            e_val = torch.norm(e_attr, p=2, dim=1)
+        else:
+            e_val = e_attr.float().view(-1)
+        src_idx = ei[0]
+        edge_attr_mean += scatter(e_val, src_idx, dim=0, dim_size=num_nodes, reduce="mean")
+        edge_attr_sum += scatter(e_val, src_idx, dim=0, dim_size=num_nodes, reduce="sum")
+
+    for edge_type in data.edge_types:
+        src, _, dst = edge_type
+        if src != target_node_type or dst == target_node_type:
+            continue
+        ei, _ = get_valid_edges(edge_type, mode="src")
+        if ei.numel() == 0:
+            continue
+        if not hasattr(data[dst], "feat") or data[dst].feat is None:
+            continue
+        dst_feat = data[dst].feat.cpu()
+        dst_norm = torch.norm(dst_feat, p=2, dim=1)
+        src_idx = ei[0]
+        dst_idx = ei[1]
+        neighbor_norm_agg += scatter(dst_norm[dst_idx], src_idx, dim=0, dim_size=num_nodes, reduce="mean")
+
+    self_norm = torch.norm(raw_feat, p=2, dim=1)
+
+    structural_feat_all = torch.stack(
+        [
+            torch.log1p(node_degree),
+            edge_attr_mean,
+            torch.log1p(edge_attr_sum),
+            torch.log1p(neighbor_norm_agg),
+            torch.log1p(self_norm),
+        ],
+        dim=1,
+    )
+
+    structural_feat_batch = structural_feat_all[node_indices]
+    structural_feat_batch = structural_feat_batch * structural_weight
+    return structural_feat_batch
+
 def pre_generate_all_tasks(total_tasks, pca_dim=128, max_clusters=args.max_clusters, num_clustering_views=100, structure_dim=5):
     num_struct_feats = structure_dim
     full_x = data[args.target_node_type].feat.cpu().numpy()
@@ -362,7 +469,7 @@ def pre_generate_all_tasks(total_tasks, pca_dim=128, max_clusters=args.max_clust
             ("semantic", x_semantic_pca, n_semantic)
         ]
         pool_choices = ["structural", "hybrid", "semantic"]
-        pool_weights = [0.3, 0.5, 0.2] 
+        pool_weights = [0.3, 0.5, 0.2]
         
     else:
         
@@ -468,38 +575,139 @@ def run_experiment(seed: int):
     train_ids, train_times, train_labels = load_split(task_data_dir, split="train", col_type=col_type)
     test_ids, test_times, test_labels = load_split(task_data_dir, split="test", col_type=col_type)
 
-    node_to_label = {int(nid): int(lbl) for nid, lbl in zip(train_ids.tolist(), train_labels.tolist())}
-    label_to_nodes = {}
-    for nid, lbl in node_to_label.items(): label_to_nodes.setdefault(lbl, []).append(nid)
-    
-    downstream_support_ids = []
-    for c in list(label_to_nodes.keys()):
-        nodes = label_to_nodes[c]
-        sampled = random.sample(nodes, args.k_shot) if len(nodes) >= args.k_shot else nodes
-        downstream_support_ids.extend(sampled)
-    
-    id_to_pos = {int(nid): i for i, nid in enumerate(train_ids.tolist())}
-    support_positions = [id_to_pos[nid] for nid in downstream_support_ids]
+    label_to_indices = {}
+    for i, lbl in enumerate(train_labels.tolist()):
+        lbl = int(lbl)
+        label_to_indices.setdefault(lbl, []).append(i)
+
+    support_positions = []
+    for _, indices in label_to_indices.items():
+        sampled_indices = random.sample(indices, args.k_shot) if len(indices) >= args.k_shot else indices
+        support_positions.extend(sampled_indices)
+
+    downstream_support_ids_t = torch.tensor(train_ids[support_positions], dtype=torch.long)
     downstream_support_times = torch.tensor(train_times[support_positions], dtype=torch.long)
-    downstream_support_ids_t = torch.tensor(downstream_support_ids, dtype=torch.long)
     downstream_support_labels = torch.tensor(train_labels[support_positions], dtype=torch.long).to(device)
 
     downstream_support_loader = create_loader(data, downstream_support_times, downstream_support_ids_t, batch_size=32)
     test_loader = create_loader(data, torch.tensor(test_times, dtype=torch.long), torch.tensor(test_ids, dtype=torch.long), batch_size=32)
     test_labels_t = torch.tensor(test_labels, dtype=torch.long).to(device)
 
-    def get_embeddings(loader):
+    def inject_batch_stats(batch, times):
+        if target_added_dim == 0:
+            return batch
+
+        target = args.target_node_type
+        bs = batch[target].batch_size if hasattr(batch[target], 'batch_size') else batch[target].num_nodes
+
+        n_ids = batch[target].n_id[:bs].cpu()
+
+        temp_loader = NeighborLoader(
+            data,
+            num_neighbors=[-1],
+            time_attr="time",
+            input_nodes=(target, n_ids),
+            input_time=times,
+            batch_size=bs,
+            shuffle=False,
+            num_workers=0,
+        )
+        exact_batch = next(iter(temp_loader)).to(device)
+
+        node_degree = torch.zeros(bs, device=device)
+        edge_attr_mean = torch.zeros(bs, device=device)
+        edge_attr_sum = torch.zeros(bs, device=device)
+        neighbor_norm_agg = torch.zeros(bs, device=device)
+
+        for edge_type in exact_batch.edge_types:
+            src, rel, dst = edge_type
+            edge_index = exact_batch[edge_type].edge_index
+
+            if src == target:
+                seed_mask = edge_index[0] < bs
+                valid_src = edge_index[0][seed_mask]
+
+                if valid_src.numel() > 0:
+                    node_degree.scatter_add_(0, valid_src, torch.ones_like(valid_src, dtype=torch.float))
+
+                    if hasattr(exact_batch[edge_type], 'feat') and exact_batch[edge_type].feat is not None:
+                        e_attr = exact_batch[edge_type].feat[seed_mask]
+                        e_val = torch.norm(e_attr, p=2, dim=1) if (e_attr.dim() > 1 and e_attr.shape[1] > 1) else e_attr.float().squeeze()
+                        try:
+                            edge_attr_mean += scatter(e_val, valid_src, dim=0, dim_size=bs, reduce='mean')
+                            edge_attr_sum += scatter(e_val, valid_src, dim=0, dim_size=bs, reduce='sum')
+                        except: pass
+
+                    if dst != target and hasattr(exact_batch[dst], 'feat') and exact_batch[dst].feat is not None:
+                        valid_dst = edge_index[1][seed_mask]
+                        dst_feat = exact_batch[dst].feat[valid_dst]
+                        dst_norm = torch.norm(dst_feat, p=2, dim=1)
+                        try:
+                            neighbor_norm_agg += scatter(dst_norm, valid_src, dim=0, dim_size=bs, reduce='mean')
+                        except: pass
+
+            elif dst == target:
+                seed_mask = edge_index[1] < bs
+                valid_dst = edge_index[1][seed_mask]
+                if valid_dst.numel() > 0:
+                    node_degree.scatter_add_(0, valid_dst, torch.ones_like(valid_dst, dtype=torch.float))
+
+        original_dim = batch[target].feat.shape[1] - target_added_dim
+        raw_feat_seeds = batch[target].feat[:bs, :original_dim]
+
+        new_feats_list = [torch.log1p(node_degree).unsqueeze(1)]
+        if target_added_dim >= 5:
+            new_feats_list.append(edge_attr_mean.unsqueeze(1))
+            new_feats_list.append(torch.log1p(edge_attr_sum).unsqueeze(1))
+        new_feats_list.append(torch.log1p(neighbor_norm_agg).unsqueeze(1))
+
+        self_norm = torch.norm(raw_feat_seeds, p=2, dim=1).unsqueeze(1)
+        new_feats_list.append(torch.log1p(self_norm).to(device))
+
+        structural_feat = torch.cat(new_feats_list, dim=1)
+
+        if bs > 1:
+            mean = structural_feat.mean(dim=0, keepdim=True)
+            std = structural_feat.std(dim=0, keepdim=True) + 1e-6
+            structural_feat = (structural_feat - mean) / std
+        structural_feat = structural_feat * 10.0
+
+        batch[target].feat[:bs, -target_added_dim:] = structural_feat
+        return batch
+
+    def get_embeddings(loader, base_times: torch.Tensor):
+        base_times = base_times.to(torch.long).cpu()
         model.eval()
         embeddings = []
         with torch.no_grad():
             for batch in loader:
+                batch = inject_batch_stats(batch, base_times)
                 batch = batch.to(device)
 
                 if hasattr(batch[args.target_node_type], 'batch_size'):
                     current_batch_size = batch[args.target_node_type].batch_size
                 else:
                     current_batch_size = batch[args.target_node_type].num_nodes
-                
+
+                if args.use_structure == 1 and target_added_dim > 0:
+                    input_pos = batch[args.target_node_type].input_id[:current_batch_size].cpu().long()
+                    seed_times = base_times[input_pos]
+                    seed_global_ids = batch[args.target_node_type].n_id[:current_batch_size].cpu().long()
+
+                    dynamic_struct = compute_dynamic_struct_features_for_nodes(
+                        data=data,
+                        target_node_type=args.target_node_type,
+                        node_indices=seed_global_ids,
+                        cutoff_times=seed_times,
+                        structural_weight=10.0,
+                    )
+
+                    x = batch[args.target_node_type].feat
+                    if x.size(1) >= target_added_dim:
+                        semantic_part = x[:current_batch_size, :-target_added_dim]
+                        new_feat = torch.cat([semantic_part, dynamic_struct.to(x.device)], dim=1)
+                        x[:current_batch_size] = new_feat
+
                 full_emb = model.encode(batch, args.target_node_type)
                 
                 embeddings.append(full_emb[:current_batch_size].cpu())
@@ -598,10 +806,10 @@ def run_experiment(seed: int):
     torch.cuda.empty_cache()
     print("\nEvaluating...")
     model.eval()
-    support_embs = get_embeddings(downstream_support_loader)
+    support_embs = get_embeddings(downstream_support_loader, downstream_support_times)
     downstream_support_labels_cpu = downstream_support_labels.cpu()
     downstream_prototypes = compute_prototypes(support_embs, downstream_support_labels_cpu, 2)
-    test_embs = get_embeddings(test_loader)
+    test_embs = get_embeddings(test_loader, torch.tensor(test_times, dtype=torch.long))
     dists = euclidean_dist(test_embs, downstream_prototypes)
     probs = F.softmax(-dists, dim=1)
     pos_probs = probs[:, 1].cpu().numpy()

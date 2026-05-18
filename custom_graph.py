@@ -38,15 +38,8 @@ def _classify_tables(db: Database) -> Tuple[List[str], List[str], List[str]]:
 
 
 def _aggregate_fact_rows(table, table_name, src_table, dst_table, src_col, dst_col):
-    
-    start_time = time.time()
-    
-    if table_name is not None and src_table is not None and dst_table is not None:
-        print(f"Building edge: {src_table} -> {dst_table} (fact_table={table_name}, fkey_pair=({src_col}, {dst_col})")
-
     src = table.foreign_key[src_col]
     dst = table.foreign_key[dst_col]
-    num_edges = len(src)
 
     edge_time = table.time
     edge_feat = table.feat
@@ -61,10 +54,6 @@ def _aggregate_fact_rows(table, table_name, src_table, dst_table, src_col, dst_c
         edge_feat = edge_feat[valid_mask]
 
     edge_index = torch.stack([src, dst], dim=0)
-
-    
-    elapsed_time = time.time() - start_time
-    print(f"_aggregate_fact_rows time: {elapsed_time:.2f} seconds")
 
     return edge_index, edge_time, edge_feat
 
@@ -106,8 +95,7 @@ def make_graph_without_fact_tables(
 
     fact_tables, node_tables_single_fkey, node_tables_multi_fkey = _classify_tables(db)
     
-    metadata_path = feat_data_dir + "/metadata.yaml"
-    metadata_path = Path(metadata_path).resolve()
+    metadata_path = Path(feat_data_dir) / "metadata.yaml"
 
     if not metadata_path.is_file():
         raise FileNotFoundError(f"Metadata file not found: {metadata_path}")
@@ -122,7 +110,6 @@ def make_graph_without_fact_tables(
             print(f"\n[ERROR] Failed to load {table_name} from {path}: {e}")
             continue
 
-        print(f"\n===== Table: {table_name} =====")
         feat_list = []
         data[table_name].foreign_key = {}
         for col_name in feat.files:
@@ -161,8 +148,6 @@ def make_graph_without_fact_tables(
             src_table = ptable_a
             dst_table = ptable_b
 
-            print("keys: ", list(data[table_name].keys()))
-
             edge_index, edge_time, edge_feat = _aggregate_fact_rows(
                 table=data[table_name],
                 table_name=table_name,
@@ -176,7 +161,6 @@ def make_graph_without_fact_tables(
             
             if is_self_loop:
                 edge_type = (src_table, f"self_fact_{table_name}_{fkey_a}_to_{fkey_b}", dst_table)
-                print(f"Self-loop edge detected: {edge_type} (fkey_pair=({fkey_a}, {fkey_b})")
             else:
                 edge_type = (src_table, f"fact_{table_name}_{fkey_a}_{fkey_b}", dst_table)
             
@@ -216,7 +200,6 @@ def make_graph_without_fact_tables(
         
         if is_self_loop:
             edge_type = (table_name, f"self_fkey_{table_name}_{fkey_col}", pkey_table)
-            print(f"Self-loop edge detected: {edge_type} (fkey_column={fkey_col})")
         else:
             edge_type = (table_name, f"fkey_{fkey_col}", pkey_table)
         
@@ -256,10 +239,8 @@ def make_graph_without_fact_tables(
             
             if is_self_loop:
                 edge_type = (table_name, f"self_fkey_{table_name}_{fkey_col}", pkey_table)
-                print(f"Self-loop edge detected: {edge_type} (fkey_column={fkey_col})")
             else:
                 edge_type = (table_name, f"fkey_{fkey_col}", pkey_table)
-                print(f"Creating edge: {edge_type} (fkey_column={fkey_col}, target_table={pkey_table}, edge_count={edge_index.size(1)})")
             
             data[edge_type].edge_index = edge_index
             data[edge_type].time = edge_time
@@ -273,11 +254,11 @@ def make_graph_without_fact_tables(
                 data[rev_edge_type].time = edge_time
                 data[rev_edge_type].feat = edge_feat
 
-    data.validate()
-
     for table_name in fact_tables:
         if table_name in data.node_types:
             del data[table_name]
+
+    data.validate()
 
     all_node_time = {}
     for node_type in data.node_types:
